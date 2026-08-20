@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useState } from "react";
 import RouteControls from "./components/RouteControls";
 import RouteMap from "./components/RouteMap";
 
@@ -7,26 +7,54 @@ interface Location {
   longitude: number;
 }
 
+interface Route {
+  distance: number;
+  time: number;
+  coordinates: [number, number][];
+}
+
 function App() {
   const [distance, setDistance] = useState(10);
   const [startLocation, setStartLocation] = useState<Location | null>(null);
+  const [route, setRoute] = useState<Route | null>(null);
 
-  const handleStartLocationChange = useCallback((location: Location) => {
-    setStartLocation(location);
-  }, []);
+  const handleGenerate = async () => {
+    if (!startLocation) return;
 
-  const handleGenerate = () => {
-    console.log("Generate route:", {
-      distance,
-      startLocation,
+    console.log("Generating route...");
+
+    const response = await fetch("http://localhost:3000/api/route", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        start: startLocation,
+        destination: {
+          latitude: 52.379189,
+          longitude: 4.899431,
+        },
+      }),
     });
+
+    if (!response.ok) {
+      console.error("Failed to generate route");
+      return;
+    }
+
+    const data = await response.json();
+
+    console.log("Route received:", data);
+
+    setRoute(data);
   };
 
   return (
     <main>
       <RouteMap
         startLocation={startLocation}
-        onStartLocationChange={handleStartLocationChange}
+        onStartLocationChange={setStartLocation}
+        route={route}
       />
 
       <RouteControls
