@@ -30,10 +30,7 @@ function App() {
       },
       body: JSON.stringify({
         start: startLocation,
-        destination: {
-          latitude: 52.379189,
-          longitude: 4.899431,
-        },
+        distance,
       }),
     });
 

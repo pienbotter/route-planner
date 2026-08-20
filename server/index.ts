@@ -1,5 +1,8 @@
 import http from "node:http";
 import polyline from "@mapbox/polyline";
+import {
+  generateLoop,
+} from "./routing/routeGenerator";
 
 const PORT = 3000;
 const VALHALLA_URL = "https://valhalla1.openstreetmap.de/route";
@@ -11,7 +14,7 @@ interface Location {
 
 interface RouteRequest {
   start: Location;
-  destination: Location;
+  distance: number;
 }
 
 function sendJson(
@@ -27,55 +30,6 @@ function sendJson(
   });
 
   res.end(JSON.stringify(data));
-}
-
-
-async function getRoute(request: RouteRequest) {
-  const valhallaRequest = {
-    locations: [
-      {
-        lat: request.start.latitude,
-        lon: request.start.longitude,
-      },
-      {
-        lat: request.destination.latitude,
-        lon: request.destination.longitude,
-      },
-    ],
-    costing: "pedestrian",
-    units: "kilometers",
-  };
-
-  const response = await fetch(VALHALLA_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(valhallaRequest),
-  });
-
-  if (!response.ok) {
-    throw new Error(
-      `Valhalla returned HTTP ${response.status}`
-    );
-  }
-
-  const data = await response.json();
-
-  const shape = data.trip.legs[0].shape;
-
-  const coordinates = polyline
-    .decode(shape, 6)
-    .map(([latitude, longitude]) => [
-      longitude,
-      latitude,
-    ]);
-
-  return {
-    distance: data.trip.summary.length,
-    time: data.trip.summary.time,
-    coordinates,
-  };
 }
 
 const server = http.createServer((req, res) => {
@@ -112,9 +66,13 @@ const server = http.createServer((req, res) => {
 
         console.log("Route request received:", data);
 
-        const route = await getRoute(data);
+        const route = await generateLoop(
+        data.start,
+        data.distance
+        );
 
         sendJson(res, 200, route);
+
       } catch (error) {
         console.error(error);
 
