@@ -1,18 +1,23 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { Map, Marker, setWorkerUrl } from "maplibre-gl";
 import workerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
 import "maplibre-gl/dist/maplibre-gl.css";
 
 setWorkerUrl(workerUrl);
 
-function RouteMap() {
+interface Location {
+  latitude: number;
+  longitude: number;
+}
+
+interface RouteMapProps {
+  startLocation: Location | null;
+  onStartLocationChange: (location: Location) => void;
+}
+
+function RouteMap({ startLocation, onStartLocationChange }: RouteMapProps) {
   const mapContainer = useRef<HTMLDivElement>(null);
   const marker = useRef<Marker | null>(null);
-
-  const [startLocation, setStartLocation] = useState<{
-    latitude: number;
-    longitude: number;
-  } | null>(null);
 
   useEffect(() => {
     if (!mapContainer.current) return;
@@ -27,7 +32,7 @@ function RouteMap() {
     map.on("click", (event) => {
       const { lng, lat } = event.lngLat;
 
-      setStartLocation({
+      onStartLocationChange({
         latitude: lat,
         longitude: lng,
       });
@@ -43,7 +48,7 @@ function RouteMap() {
       marker.current?.remove();
       map.remove();
     };
-  }, []);
+  }, [onStartLocationChange]);
 
   return (
     <div
