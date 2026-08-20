@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import RouteControls from "./components/RouteControls";
 import RouteMap from "./components/RouteMap";
 
@@ -11,6 +11,10 @@ function App() {
   const [distance, setDistance] = useState(10);
   const [startLocation, setStartLocation] = useState<Location | null>(null);
 
+  const handleStartLocationChange = useCallback((location: Location) => {
+    setStartLocation(location);
+  }, []);
+
   const handleGenerate = () => {
     console.log("Generate route:", {
       distance,
@@ -22,7 +26,7 @@ function App() {
     <main>
       <RouteMap
         startLocation={startLocation}
-        onStartLocationChange={setStartLocation}
+        onStartLocationChange={handleStartLocationChange}
       />
 
       <RouteControls
