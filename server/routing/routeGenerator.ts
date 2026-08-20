@@ -1,50 +1,106 @@
 import polyline from "@mapbox/polyline";
 
-export interface Location {
+export type Location = {
   latitude: number;
   longitude: number;
-}
+};
 
-export interface GeneratedRoute {
+export type GeneratedRoute = {
   distance: number;
   time: number;
   coordinates: [number, number][];
-}
+};
+
+type Shape = {
+  rotation: number;
+  stretch: number;
+};
+
+const VALHALLA_URL =
+  "https://valhalla1.openstreetmap.de/route";
+
+const SHAPES: Shape[] = [
+  {
+    rotation: 0,
+    stretch: 1,
+  },
+  {
+    rotation: 45,
+    stretch: 1,
+  },
+  {
+    rotation: 0,
+    stretch: 1.4,
+  },
+  {
+    rotation: 45,
+    stretch: 1.4,
+  },
+];
 
 function generateWaypoints(
   start: Location,
-  radiusKm: number
+  radiusKm: number,
+  rotationDegrees: number = 0,
+  stretch: number = 1
 ): Location[] {
-  const points = [
-    { angle: 0 },
-    { angle: 90 },
-    { angle: 180 },
-    { angle: 270 },
+  const numberOfPoints = 12;
+
+  // Slightly irregular distances from the start.
+  // This prevents us from creating a perfect geometric circle.
+  const radiusFactors = [
+    1.00,
+    1.08,
+    0.94,
+    1.05,
+    0.97,
+    1.10,
+    0.95,
+    1.04,
+    1.00,
+    0.92,
+    1.07,
+    0.96,
   ];
 
   const latitudeRadians =
     (start.latitude * Math.PI) / 180;
 
-  const latitudeDistance = radiusKm / 111;
+  const latitudeDistance =
+    radiusKm / 111;
 
   const longitudeDistance =
-    radiusKm /
+    (radiusKm * stretch) /
     (111 * Math.cos(latitudeRadians));
 
-  return points.map(({ angle }) => {
+  const waypoints: Location[] = [];
+
+  for (let i = 0; i < numberOfPoints; i++) {
+    const angle =
+      (360 / numberOfPoints) * i +
+      rotationDegrees;
+
     const radians =
       (angle * Math.PI) / 180;
 
-    return {
+    const factor = radiusFactors[i];
+
+    waypoints.push({
       latitude:
         start.latitude +
-        Math.sin(radians) * latitudeDistance,
+        Math.sin(radians) *
+          latitudeDistance *
+          factor,
 
       longitude:
         start.longitude +
-        Math.cos(radians) * longitudeDistance,
-    };
-  });
+        Math.cos(radians) *
+          longitudeDistance *
+          factor,
+    });
+  }
+
+  return waypoints;
 }
 
 async function routeThroughPoints(
@@ -55,123 +111,59 @@ async function routeThroughPoints(
     start,
     ...waypoints,
     start,
-  ];
+  ].map((location) => ({
+    lat: location.latitude,
+    lon: location.longitude,
+  }));
 
-  const allCoordinates: [number, number][] = [];
+  const response = await fetch(VALHALLA_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      locations,
+      costing: "pedestrian",
+      units: "kilometers",
+    }),
+  });
 
-  let totalDistance = 0;
-  let totalTime = 0;
-
-  for (let i = 0; i < locations.length - 1; i++) {
-    const from = locations[i];
-    const to = locations[i + 1];
-
-    const response = await fetch(
-      "https://valhalla1.openstreetmap.de/route",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          locations: [
-            {
-              lat: from.latitude,
-              lon: from.longitude,
-            },
-            {
-              lat: to.latitude,
-              lon: to.longitude,
-            },
-          ],
-          costing: "pedestrian",
-          units: "kilometers",
-        }),
-      }
-    );
-
-    if (!response.ok) {
-      throw new Error(
-        `Valhalla returned HTTP ${response.status}`
-      );
-    }
-
-    const data = await response.json();
-
-    const legCoordinates =
-      polyline
-        .decode(data.trip.legs[0].shape, 6)
-        .map(
-          ([latitude, longitude]) =>
-            [longitude, latitude] as [number, number]
-        );
-
-    allCoordinates.push(...legCoordinates);
-
-    totalDistance += data.trip.summary.length;
-    totalTime += data.trip.summary.time;
-
-    console.log(
-      `Leg ${i + 1}: ${data.trip.summary.length.toFixed(
-        2
-      )} km`
+  if (!response.ok) {
+    throw new Error(
+      `Valhalla returned HTTP ${response.status}`
     );
   }
 
+  const data = await response.json();
+
+  const coordinates =
+    data.trip.legs.flatMap(
+      (leg: { shape: string }) =>
+        polyline
+          .decode(leg.shape, 6)
+          .map(
+            ([latitude, longitude]) =>
+              [longitude, latitude] as [
+                number,
+                number
+              ]
+          )
+    );
+
   return {
-    distance: totalDistance,
-    time: totalTime,
-    coordinates: allCoordinates,
+    distance: data.trip.summary.length,
+    time: data.trip.summary.time,
+    coordinates,
   };
 }
 
-function calculateBacktrackingPenalty(
-  coordinates: [number, number][]
+function calculateDistanceError(
+  routeDistanceKm: number,
+  targetDistanceKm: number
 ): number {
-  let penalty = 0;
-
-  for (let i = 2; i < coordinates.length; i++) {
-    const previous = coordinates[i - 2];
-    const current = coordinates[i - 1];
-    const next = coordinates[i];
-
-    const vector1 = {
-      x: current[0] - previous[0],
-      y: current[1] - previous[1],
-    };
-
-    const vector2 = {
-      x: next[0] - current[0],
-      y: next[1] - current[1],
-    };
-
-    const dot =
-      vector1.x * vector2.x +
-      vector1.y * vector2.y;
-
-    const magnitude1 = Math.sqrt(
-      vector1.x ** 2 +
-        vector1.y ** 2
-    );
-
-    const magnitude2 = Math.sqrt(
-      vector2.x ** 2 +
-        vector2.y ** 2
-    );
-
-    if (magnitude1 === 0 || magnitude2 === 0) {
-      continue;
-    }
-
-    const cosine =
-      dot / (magnitude1 * magnitude2);
-
-    if (cosine < -0.8) {
-      penalty += 1;
-    }
-  }
-
-  return penalty;
+  return Math.abs(
+    routeDistanceKm - targetDistanceKm
+  );
 }
 
 export async function generateLoop(
@@ -181,12 +173,17 @@ export async function generateLoop(
   let radiusKm = targetDistanceKm / 8;
 
   let bestRoute: GeneratedRoute | null = null;
-  let bestScore = Infinity;
+  let bestError = Infinity;
 
   for (let attempt = 0; attempt < 5; attempt++) {
+    const shape =
+      SHAPES[attempt % SHAPES.length];
+
     const waypoints = generateWaypoints(
       start,
-      radiusKm
+      radiusKm,
+      shape.rotation,
+      shape.stretch
     );
 
     const route = await routeThroughPoints(
@@ -194,38 +191,33 @@ export async function generateLoop(
       waypoints
     );
 
-    const error = Math.abs(
-      route.distance - targetDistanceKm
+    const error = calculateDistanceError(
+      route.distance,
+      targetDistanceKm
     );
 
     console.log(
-      `Attempt ${attempt + 1}: radius ${radiusKm.toFixed(
-        2
-      )} km → route ${route.distance.toFixed(
-        2
-      )} km`
+      `Attempt ${attempt + 1}: ` +
+        `radius ${radiusKm.toFixed(2)} km → ` +
+        `route ${route.distance.toFixed(2)} km`
     );
 
-    const backtrackingPenalty =
-  calculateBacktrackingPenalty(
-    route.coordinates
-  );
+    console.log(
+      `Attempt ${attempt + 1}: ` +
+        `distance ${route.distance.toFixed(2)} km, ` +
+        `distance error ${error.toFixed(2)} km`
+    );
 
-console.log(
-  `Attempt ${attempt + 1}: ` +
-    `distance ${route.distance.toFixed(2)} km, ` +
-    `distance error ${error.toFixed(2)} km, ` +
-    `backtracking ${backtrackingPenalty}`
-);
+    console.log(
+      `Route has ${route.coordinates.length} coordinate points`
+    );
 
-    const score =
-  error + backtrackingPenalty * 0.5;
+    if (error < bestError) {
+      bestRoute = route;
+      bestError = error;
+    }
 
-if (score < bestScore) {
-  bestRoute = route;
-  bestScore = score;
-}
-
+    // Adjust the radius for the next attempt.
     if (route.distance > targetDistanceKm) {
       radiusKm *= 0.8;
     } else {
@@ -234,7 +226,9 @@ if (score < bestScore) {
   }
 
   if (!bestRoute) {
-    throw new Error("Could not generate a route");
+    throw new Error(
+      "Could not generate a route."
+    );
   }
 
   return bestRoute;
