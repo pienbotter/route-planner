@@ -1,11 +1,9 @@
 import http from "node:http";
-import polyline from "@mapbox/polyline";
 import {
   generateLoop,
 } from "./routing/routeGenerator";
 
 const PORT = 3000;
-const VALHALLA_URL = "https://valhalla1.openstreetmap.de/route";
 
 interface Location {
   latitude: number;
