@@ -1,3 +1,5 @@
+import polyline from "@mapbox/polyline";
+
 export type Location = {
   latitude: number;
   longitude: number;
@@ -56,10 +58,6 @@ export async function getRoute(
   const coordinates: [number, number][] = [];
 
   for (const leg of data.trip.legs) {
-    // We'll decode the Valhalla shape here.
-    // This assumes your existing polyline dependency.
-    const polyline = await import("@mapbox/polyline");
-
     const decoded =
       polyline.decode(leg.shape, 6);
 
