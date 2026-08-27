@@ -1,6 +1,8 @@
 import { getRoute, Location } from "./valhalla";
 
 type RouteQuality = {
+  sameDirectionOverlapKm: number;
+  oppositeDirectionOverlapKm: number;
   overlapKm: number;
   score: number;
 };
@@ -57,30 +59,6 @@ function createPoint(
       (newLongitude * 180) / Math.PI,
   };
 }
-
-type Shape = {
-  rotation: number;
-  stretch: number;
-};
-
-const shapes: Shape[] = [
-  {
-    rotation: 0,
-    stretch: 1,
-  },
-  {
-    rotation: 45,
-    stretch: 1,
-  },
-  {
-    rotation: 90,
-    stretch: 1,
-  },
-  {
-    rotation: 135,
-    stretch: 1,
-  },
-];
 
 function distanceBetweenPoints(
   a: [number, number],
@@ -157,28 +135,33 @@ function angleDifference(
   );
 }
 
-function calculateRouteQuality(
+type Sample = {
+  point: [number, number];
+  bearing: number;
+  distanceFromStart: number;
+};
+
+/**
+ * Create evenly spaced samples along the route.
+ *
+ * Using evenly spaced samples is important because
+ * Valhalla's geometry can contain very short or very
+ * long segments. Comparing raw geometry points would
+ * therefore make the overlap calculation inconsistent.
+ */
+function createSamples(
   coordinates: [number, number][]
-): RouteQuality {
+): Sample[] {
   if (coordinates.length < 2) {
-    return {
-      overlapKm: 0,
-      score: 0,
-    };
+    return [];
   }
 
-  const WINDOW_LENGTH_KM = 0.2;
   const SAMPLE_DISTANCE_KM = 0.05;
-
-  type Sample = {
-    point: [number, number];
-    bearing: number;
-    distanceFromStart: number;
-  };
 
   const samples: Sample[] = [];
 
   let distanceFromStart = 0;
+  let nextSampleDistance = 0;
 
   for (
     let i = 0;
@@ -191,95 +174,784 @@ function calculateRouteQuality(
     const segmentLength =
       distanceBetweenPoints(a, b);
 
-    if (segmentLength === 0) {
+    if (segmentLength <= 0) {
       continue;
     }
 
     const bearing =
       calculateBearing(a, b);
 
-    samples.push({
-      point: a,
-      bearing,
-      distanceFromStart,
-    });
+    /*
+     * Add samples along the segment whenever
+     * we cross the next sampling distance.
+     */
+    while (
+      nextSampleDistance <=
+      distanceFromStart + segmentLength
+    ) {
+      const distanceIntoSegment =
+        nextSampleDistance -
+        distanceFromStart;
+
+      if (
+        distanceIntoSegment < -0.000001
+      ) {
+        break;
+      }
+
+      const fraction =
+        segmentLength === 0
+          ? 0
+          : Math.max(
+              0,
+              Math.min(
+                1,
+                distanceIntoSegment /
+                  segmentLength
+              )
+            );
+
+      const point: [number, number] = [
+        a[0] +
+          (b[0] - a[0]) *
+            fraction,
+        a[1] +
+          (b[1] - a[1]) *
+            fraction,
+      ];
+
+      samples.push({
+        point,
+        bearing,
+        distanceFromStart:
+          nextSampleDistance,
+      });
+
+      nextSampleDistance +=
+        SAMPLE_DISTANCE_KM;
+    }
 
     distanceFromStart += segmentLength;
   }
 
-  let overlapKm = 0;
+  /*
+   * Make sure we have at least one sample near
+   * the end of the route.
+   */
+  if (
+    coordinates.length >= 2 &&
+    samples.length > 0
+  ) {
+    const last =
+      coordinates[
+        coordinates.length - 1
+      ];
+
+    const previous =
+      coordinates[
+        coordinates.length - 2
+      ];
+
+    const lastDistance =
+      distanceBetweenPoints(
+        previous,
+        last
+      );
+
+    const lastBearing =
+      calculateBearing(
+        previous,
+        last
+      );
+
+    const totalDistance =
+      distanceFromStart;
+
+    const lastSample =
+      samples[samples.length - 1];
+
+    if (
+      totalDistance -
+        lastSample.distanceFromStart >
+      SAMPLE_DISTANCE_KM * 0.5
+    ) {
+      samples.push({
+        point: last,
+        bearing: lastBearing,
+        distanceFromStart:
+          totalDistance,
+      });
+    }
+  }
+
+  return samples;
+}
+
+/**
+ * Find the closest route sample to a given sample
+ * inside a range of route indices.
+ */
+function findBestMatchingSample(
+  samples: Sample[],
+  sourceIndex: number,
+  searchStart: number,
+  searchEnd: number,
+  requireOppositeDirection: boolean
+): number | null {
+  const source =
+    samples[sourceIndex];
+
+  const MAX_DISTANCE_KM = 0.02;
+
+  let bestIndex: number | null = null;
+  let bestDistance =
+    Infinity;
+
+  for (
+    let j = searchStart;
+    j <= searchEnd;
+    j++
+  ) {
+    if (j < 0 || j >= samples.length) {
+      continue;
+    }
+
+    const candidate =
+      samples[j];
+
+    const spatialDistance =
+      distanceBetweenPoints(
+        source.point,
+        candidate.point
+      );
+
+    if (
+      spatialDistance >
+      MAX_DISTANCE_KM
+    ) {
+      continue;
+    }
+
+    const directionDifference =
+      angleDifference(
+        source.bearing,
+        candidate.bearing
+      );
+
+    if (requireOppositeDirection) {
+      if (
+        directionDifference < 150
+      ) {
+        continue;
+      }
+    }
+
+    if (
+      spatialDistance <
+      bestDistance
+    ) {
+      bestDistance =
+        spatialDistance;
+      bestIndex = j;
+    }
+  }
+
+  return bestIndex;
+}
+
+/**
+ * Detect continuous sections of the route that
+ * appear to be driven twice in opposite directions.
+ *
+ * This is deliberately much stricter than comparing
+ * every pair of route points.
+ *
+ * A backtracking section should have this structure:
+ *
+ *   route A:  -------------------->
+ *
+ *   route B:  <--------------------
+ *
+ * and the matching points should progress through
+ * both sections of the route continuously.
+ */
+function detectContinuousOppositeOverlap(
+  samples: Sample[]
+): number {
+  if (samples.length < 2) {
+    return 0;
+  }
+
+  const SAMPLE_DISTANCE_KM = 0.05;
+
+  /*
+   * A genuine backtracking section must be at least
+   * this long before we penalize it.
+   *
+   * This prevents crossings and tiny switchbacks
+   * from becoming "overlap".
+   */
+  const MIN_BACKTRACK_LENGTH_KM = 0.30;
+
+  /*
+   * How much the matching position is allowed to
+   * deviate from the expected progression.
+   */
+  const MAX_MATCH_GAP_SAMPLES = 3;
+
+  /*
+   * We don't compare nearby route sections.
+   */
+  const MIN_ROUTE_SEPARATION_KM = 0.50;
+
+  /*
+   * We don't need to search the entire route for
+   * every sample.
+   */
+  const MAX_ROUTE_SEPARATION_KM = 15;
+
+  const match: Array<
+    number | null
+  > = new Array(samples.length).fill(
+    null
+  );
+
+  /*
+   * First find possible opposite-direction matches.
+   */
+  for (
+    let i = 0;
+    i < samples.length;
+    i++
+  ) {
+    const source =
+      samples[i];
+
+    let lowerIndex = i + 1;
+    let upperIndex =
+      samples.length - 1;
+
+    /*
+     * Restrict the search by route distance.
+     */
+    while (
+      lowerIndex <
+        samples.length &&
+      samples[lowerIndex]
+        .distanceFromStart -
+        source.distanceFromStart <
+        MIN_ROUTE_SEPARATION_KM
+    ) {
+      lowerIndex++;
+    }
+
+    while (
+      upperIndex >= lowerIndex &&
+      samples[upperIndex]
+        .distanceFromStart -
+        source.distanceFromStart >
+        MAX_ROUTE_SEPARATION_KM
+    ) {
+      upperIndex--;
+    }
+
+    if (lowerIndex > upperIndex) {
+      continue;
+    }
+
+    match[i] =
+      findBestMatchingSample(
+        samples,
+        i,
+        lowerIndex,
+        upperIndex,
+        true
+      );
+  }
+
+  /*
+   * Now identify continuous runs.
+   *
+   * For actual backtracking, if route sample i
+   * matches route sample j, the next samples should
+   * approximately match:
+   *
+   *   i + 1 -> j - 1
+   *   i + 2 -> j - 2
+   *
+   * because the second occurrence is being travelled
+   * in the opposite direction.
+   */
+  const visited = new Set<number>();
+
+  let totalBacktrackingKm = 0;
+
+  for (
+    let startIndex = 0;
+    startIndex < samples.length;
+    startIndex++
+  ) {
+    if (
+      match[startIndex] === null
+    ) {
+      continue;
+    }
+
+    if (
+      visited.has(startIndex)
+    ) {
+      continue;
+    }
+
+    const startMatch =
+      match[startIndex];
+
+    if (
+      startMatch === null
+    ) {
+      continue;
+    }
+
+    /*
+     * The two occurrences need to be separated
+     * along the route.
+     */
+    if (
+      Math.abs(
+        samples[startMatch]
+          .distanceFromStart -
+          samples[startIndex]
+            .distanceFromStart
+      ) <
+      MIN_ROUTE_SEPARATION_KM
+    ) {
+      continue;
+    }
+
+    let runLength = 1;
+
+    let previousSource =
+      startIndex;
+
+    let previousMatch =
+      startMatch;
+
+    const runIndices: number[] = [
+      startIndex,
+    ];
+
+    while (true) {
+      const nextSource =
+        previousSource + 1;
+
+      if (
+        nextSource >=
+        samples.length
+      ) {
+        break;
+      }
+
+      const expectedMatch =
+        previousMatch - 1;
+
+      if (
+        expectedMatch < 0
+      ) {
+        break;
+      }
+
+      const actualMatch =
+        match[nextSource];
+
+      if (
+        actualMatch === null
+      ) {
+        break;
+      }
+
+      /*
+       * Because the second section is traversed
+       * backwards, its sample index should decrease.
+       */
+      const matchDeviation =
+        Math.abs(
+          actualMatch -
+            expectedMatch
+        );
+
+      if (
+        matchDeviation >
+        MAX_MATCH_GAP_SAMPLES
+      ) {
+        break;
+      }
+
+      /*
+       * Verify that the actual matched points are
+       * still spatially close.
+       */
+      const spatialDistance =
+        distanceBetweenPoints(
+          samples[nextSource].point,
+          samples[actualMatch].point
+        );
+
+      if (
+        spatialDistance >
+        0.02
+      ) {
+        break;
+      }
+
+      runLength++;
+
+      runIndices.push(
+        nextSource
+      );
+
+      previousSource =
+        nextSource;
+
+      previousMatch =
+        actualMatch;
+    }
+
+    const runDistance =
+      runLength *
+      SAMPLE_DISTANCE_KM;
+
+    /*
+     * Only count sufficiently long continuous runs.
+     */
+    if (
+      runDistance >=
+      MIN_BACKTRACK_LENGTH_KM
+    ) {
+      /*
+       * Mark this run as processed.
+       */
+      for (
+        const index of runIndices
+      ) {
+        visited.add(index);
+      }
+
+      totalBacktrackingKm +=
+        runDistance;
+    }
+  }
+
+  /*
+   * The same physical overlap can sometimes be
+   * discovered from both ends. Clamp the result
+   * conservatively.
+   */
+  return Math.min(
+    totalBacktrackingKm,
+    samples.length *
+      SAMPLE_DISTANCE_KM
+  );
+}
+
+/**
+ * Detect same-direction reuse separately.
+ *
+ * Same-direction reuse is much less problematic than
+ * actual backtracking, so it receives a small penalty.
+ */
+function detectContinuousSameDirectionOverlap(
+  samples: Sample[]
+): number {
+  if (samples.length < 2) {
+    return 0;
+  }
+
+  const SAMPLE_DISTANCE_KM = 0.05;
+
+  const MIN_REUSE_LENGTH_KM = 0.30;
+  const MIN_ROUTE_SEPARATION_KM = 0.50;
+  const MAX_ROUTE_SEPARATION_KM = 15;
+
+  const matches: Array<
+    number | null
+  > = new Array(samples.length).fill(
+    null
+  );
 
   for (
     let i = 0;
     i < samples.length;
     i++
   ) {
-    const first = samples[i];
+    const source =
+      samples[i];
+
+    let searchStart = i + 1;
+    let searchEnd =
+      samples.length - 1;
+
+    while (
+      searchStart <
+        samples.length &&
+      samples[searchStart]
+        .distanceFromStart -
+        source.distanceFromStart <
+        MIN_ROUTE_SEPARATION_KM
+    ) {
+      searchStart++;
+    }
+
+    while (
+      searchEnd >= searchStart &&
+      samples[searchEnd]
+        .distanceFromStart -
+        source.distanceFromStart >
+        MAX_ROUTE_SEPARATION_KM
+    ) {
+      searchEnd--;
+    }
+
+    if (
+      searchStart > searchEnd
+    ) {
+      continue;
+    }
+
+    let bestIndex:
+      | number
+      | null = null;
+
+    let bestDistance =
+      Infinity;
 
     for (
-      let j = i + 1;
-      j < samples.length;
+      let j = searchStart;
+      j <= searchEnd;
       j++
     ) {
-      const second = samples[j];
+      const candidate =
+        samples[j];
 
-      const routeSeparation =
-        second.distanceFromStart -
-        first.distanceFromStart;
+      const spatialDistance =
+        distanceBetweenPoints(
+          source.point,
+          candidate.point
+        );
 
-      // Don't compare nearby parts of the
-      // route. They naturally follow each other.
       if (
-        routeSeparation <
-        WINDOW_LENGTH_KM * 2
+        spatialDistance >
+        0.02
       ) {
         continue;
       }
 
-      // Don't compare sections that are
-      // extremely far apart in the route.
+      const directionDifference =
+        angleDifference(
+          source.bearing,
+          candidate.bearing
+        );
+
       if (
-        routeSeparation > 10
+        directionDifference >
+        30
+      ) {
+        continue;
+      }
+
+      if (
+        spatialDistance <
+        bestDistance
+      ) {
+        bestDistance =
+          spatialDistance;
+        bestIndex = j;
+      }
+    }
+
+    matches[i] = bestIndex;
+  }
+
+  let totalReuseKm = 0;
+
+  const visited = new Set<number>();
+
+  for (
+    let startIndex = 0;
+    startIndex < samples.length;
+    startIndex++
+  ) {
+    if (
+      matches[startIndex] ===
+      null
+    ) {
+      continue;
+    }
+
+    if (
+      visited.has(startIndex)
+    ) {
+      continue;
+    }
+
+    const startMatch =
+      matches[startIndex];
+
+    if (
+      startMatch === null
+    ) {
+      continue;
+    }
+
+    let runLength = 1;
+
+    let previousSource =
+      startIndex;
+
+    let previousMatch =
+      startMatch;
+
+    const runIndices: number[] = [
+      startIndex,
+    ];
+
+    while (true) {
+      const nextSource =
+        previousSource + 1;
+
+      if (
+        nextSource >=
+        samples.length
+      ) {
+        break;
+      }
+
+      const actualMatch =
+        matches[nextSource];
+
+      if (
+        actualMatch === null
+      ) {
+        break;
+      }
+
+      /*
+       * Same-direction reuse should progress forward
+       * through the matching route section.
+       */
+      if (
+        actualMatch <
+        previousMatch
+      ) {
+        break;
+      }
+
+      if (
+        Math.abs(
+          actualMatch -
+            previousMatch
+        ) > 3
       ) {
         break;
       }
 
       const spatialDistance =
         distanceBetweenPoints(
-          first.point,
-          second.point
+          samples[nextSource].point,
+          samples[actualMatch].point
         );
 
-      if (spatialDistance > 0.05) {
-        continue;
-      }
-
-      const directionDifference =
-        angleDifference(
-          first.bearing,
-          second.bearing
-        );
-
-      // Opposite direction.
       if (
-        directionDifference < 135
+        spatialDistance >
+        0.02
       ) {
-        continue;
+        break;
       }
 
-      overlapKm += SAMPLE_DISTANCE_KM;
+      runLength++;
+
+      runIndices.push(
+        nextSource
+      );
+
+      previousSource =
+        nextSource;
+
+      previousMatch =
+        actualMatch;
+    }
+
+    const runDistance =
+      runLength *
+      SAMPLE_DISTANCE_KM;
+
+    if (
+      runDistance >=
+      MIN_REUSE_LENGTH_KM
+    ) {
+      for (
+        const index of runIndices
+      ) {
+        visited.add(index);
+      }
+
+      totalReuseKm +=
+        runDistance;
     }
   }
 
-  // Don't count the same overlap hundreds
-  // of times because many points may fall
-  // on the same road.
-  overlapKm =
-    Math.min(overlapKm, distanceFromStart);
+  return Math.min(
+    totalReuseKm,
+    samples.length *
+      SAMPLE_DISTANCE_KM
+  );
+}
+
+function calculateRouteQuality(
+  coordinates: [number, number][]
+): RouteQuality {
+  const samples =
+    createSamples(coordinates);
+
+  if (samples.length < 2) {
+    return {
+      sameDirectionOverlapKm: 0,
+      oppositeDirectionOverlapKm: 0,
+      overlapKm: 0,
+      score: 0,
+    };
+  }
+
+  const oppositeDirectionOverlapKm =
+    detectContinuousOppositeOverlap(
+      samples
+    );
+
+  const sameDirectionOverlapKm =
+    detectContinuousSameDirectionOverlap(
+      samples
+    );
+
+  const overlapKm =
+    sameDirectionOverlapKm +
+    oppositeDirectionOverlapKm;
+
+  /*
+   * Opposite-direction reuse is the thing we really
+   * want to avoid.
+   *
+   * Same-direction reuse gets a much smaller penalty
+   * because it can occur naturally in real road
+   * networks.
+   */
+  const score =
+    sameDirectionOverlapKm * 1.5 +
+    oppositeDirectionOverlapKm * 8;
 
   return {
+    sameDirectionOverlapKm,
+    oppositeDirectionOverlapKm,
     overlapKm,
-    score: overlapKm * 2,
+    score,
   };
 }
 
@@ -307,39 +979,50 @@ export async function generateLoop(
     135,
   ];
 
-  let bestRoute: GeneratedRoute | null = null;
+  let bestRoute:
+    | GeneratedRoute
+    | null = null;
+
   let bestScore = Infinity;
 
-  for (const rotation of rotations) {
+  for (
+    const rotation of rotations
+  ) {
     console.log(
       `\n=== Rotation ${rotation}° ===`
     );
 
-    for (const radiusKm of radii) {
-      const pointB = createPoint(
-        start,
-        radiusKm,
-        rotation
-      );
+    for (
+      const radiusKm of radii
+    ) {
+      const pointB =
+        createPoint(
+          start,
+          radiusKm,
+          rotation
+        );
 
-      const pointC = createPoint(
-        start,
-        radiusKm,
-        rotation + 120
-      );
+      const pointC =
+        createPoint(
+          start,
+          radiusKm,
+          rotation + 120
+        );
 
       try {
-        const route = await getRoute([
-          start,
-          pointB,
-          pointC,
-          start,
-        ]);
+        const route =
+          await getRoute([
+            start,
+            pointB,
+            pointC,
+            start,
+          ]);
 
-        const distanceError = Math.abs(
-          route.distance -
-            targetDistanceKm
-        );
+        const distanceError =
+          Math.abs(
+            route.distance -
+              targetDistanceKm
+          );
 
         const quality =
           calculateRouteQuality(
@@ -355,11 +1038,15 @@ export async function generateLoop(
             `Radius ${radiusKm.toFixed(2)} → ` +
             `${route.distance.toFixed(2)} km | ` +
             `error ${distanceError.toFixed(2)} | ` +
-            `overlap ${quality.overlapKm.toFixed(2)} | ` +
+            `overlap ${quality.overlapKm.toFixed(2)} ` +
+            `(same ${quality.sameDirectionOverlapKm.toFixed(2)}, ` +
+            `opposite ${quality.oppositeDirectionOverlapKm.toFixed(2)}) | ` +
             `score ${score.toFixed(2)}`
         );
 
-        if (score < bestScore) {
+        if (
+          score < bestScore
+        ) {
           bestScore = score;
           bestRoute = route;
         }
