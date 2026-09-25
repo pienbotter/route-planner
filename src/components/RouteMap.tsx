@@ -36,9 +36,12 @@ function RouteMap({
 
     const mapInstance = new Map({
       container: mapContainer.current,
+
       center: [4.9, 52.37],
       zoom: 11,
-      style: "https://demotiles.maplibre.org/style.json",
+
+      // Real OpenStreetMap-based vector map.
+      style: "https://tiles.openfreemap.org/styles/liberty",
     });
 
     map.current = mapInstance;
@@ -82,10 +85,8 @@ function RouteMap({
       },
     };
 
-    if (mapInstance.getSource(sourceId)) {
-      (mapInstance.getSource(sourceId) as GeoJSONSource).setData(geojson);
-    } else {
-      const addRoute = () => {
+    const addRoute = () => {
+      if (!mapInstance.getSource(sourceId)) {
         mapInstance.addSource(sourceId, {
           type: "geojson",
           data: geojson,
@@ -95,20 +96,44 @@ function RouteMap({
           id: layerId,
           type: "line",
           source: sourceId,
+          layout: {
+            "line-join": "round",
+            "line-cap": "round",
+          },
           paint: {
-            "line-width": 5,
+            "line-width": 6,
             "line-color": "#2563eb",
+            "line-opacity": 0.9,
           },
         });
-      };
-
-      if (mapInstance.isStyleLoaded()) {
-        addRoute();
       } else {
-        mapInstance.once("load", addRoute);
+        (mapInstance.getSource(sourceId) as GeoJSONSource).setData(geojson);
       }
+    };
+
+    if (mapInstance.isStyleLoaded()) {
+      addRoute();
+    } else {
+      mapInstance.once("load", addRoute);
     }
   }, [route]);
+
+  // Keep the marker synchronized if startLocation is changed
+  // from somewhere other than clicking the map.
+  useEffect(() => {
+    if (!map.current || !startLocation) return;
+
+    const lngLat: [number, number] = [
+      startLocation.longitude,
+      startLocation.latitude,
+    ];
+
+    if (marker.current) {
+      marker.current.setLngLat(lngLat);
+    } else {
+      marker.current = new Marker().setLngLat(lngLat).addTo(map.current);
+    }
+  }, [startLocation]);
 
   return (
     <div
