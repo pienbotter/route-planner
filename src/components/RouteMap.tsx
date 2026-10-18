@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+
 import {
   Map,
   Marker,
@@ -38,6 +39,7 @@ function RouteMap({
   const map = useRef<Map | null>(null);
   const marker = useRef<Marker | null>(null);
 
+  // Initialize the map once and clean it up on unmount.
   useEffect(() => {
     if (!mapContainer.current) {
       return;
@@ -55,11 +57,9 @@ function RouteMap({
     const handleMapClick = (event: {
       lngLat: { lng: number; lat: number };
     }) => {
-      const { lng, lat } = event.lngLat;
-
       onStartLocationChange({
-        latitude: lat,
-        longitude: lng,
+        latitude: event.lngLat.lat,
+        longitude: event.lngLat.lng,
       });
     };
 
@@ -67,6 +67,7 @@ function RouteMap({
 
     return () => {
       mapInstance.off("click", handleMapClick);
+
       marker.current?.remove();
       marker.current = null;
 
@@ -75,7 +76,7 @@ function RouteMap({
     };
   }, [onStartLocationChange]);
 
-  // Keep the start marker synchronized with React state.
+  // Keep the starting-point marker synchronized with state.
   useEffect(() => {
     const mapInstance = map.current;
 
@@ -95,16 +96,23 @@ function RouteMap({
     }
   }, [startLocation]);
 
-  // Display the latest route and fit the map to its bounds.
+  // Draw the latest generated route.
   useEffect(() => {
     const mapInstance = map.current;
 
-    if (!mapInstance || !route || route.coordinates.length < 2) {
+    if (
+      !mapInstance ||
+      !route ||
+      !Array.isArray(route.coordinates) ||
+      route.coordinates.length < 2
+    ) {
       return;
     }
 
     const sourceId = "generated-route";
     const layerId = "generated-route-line";
+
+    let cancelled = false;
 
     const geojson = {
       type: "Feature" as const,
@@ -116,8 +124,14 @@ function RouteMap({
     };
 
     const addOrUpdateRoute = () => {
-      if (mapInstance.getSource(sourceId)) {
-        (mapInstance.getSource(sourceId) as GeoJSONSource).setData(geojson);
+      if (cancelled || !mapInstance.isStyleLoaded()) {
+        return;
+      }
+
+      const existingSource = mapInstance.getSource(sourceId);
+
+      if (existingSource) {
+        (existingSource as GeoJSONSource).setData(geojson);
       } else {
         mapInstance.addSource(sourceId, {
           type: "geojson",
@@ -163,6 +177,11 @@ function RouteMap({
     } else {
       mapInstance.once("load", addOrUpdateRoute);
     }
+
+    return () => {
+      cancelled = true;
+      mapInstance.off("load", addOrUpdateRoute);
+    };
   }, [route]);
 
   return (

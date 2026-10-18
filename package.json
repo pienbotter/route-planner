@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@mapbox/polyline": "^1.2.1",
+    "dotenv": "^18.0.8",
     "maplibre-gl": "^6.4.1",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"

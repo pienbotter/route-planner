@@ -1,19 +1,11 @@
-
 import { getRoute, Location } from "./valhalla";
 
-type Coordinate = [number, number]; // [longitude, latitude]
-
-interface RouteResult {
-  distance: number; // kilometers
-  time: number; // seconds
-  coordinates: Coordinate[];
-}
+type Coordinate = [number, number];
 
 interface Candidate {
   radiusKm: number;
   rotationDeg: number;
   shape: number;
-  waypoints: Location[];
   distanceKm: number;
   timeSeconds: number;
   coordinates: Coordinate[];
@@ -30,10 +22,10 @@ interface CandidateSpec {
 
 const EARTH_RADIUS_KM = 6371;
 
-const MAX_CONCURRENCY = 6;
-const INITIAL_CANDIDATES = 16;
-const MAX_ADAPTIVE_ROUNDS = 3;
-const MAX_CANDIDATES_PER_ROUND = 6;
+const MAX_CONCURRENCY = 2;
+const INITIAL_CANDIDATES = 6;
+const MAX_ADAPTIVE_ROUNDS = 2;
+const MAX_CANDIDATES_PER_ROUND = 3;
 const TARGET_TOLERANCE = 0.03;
 
 const MIN_RADIUS_KM = 0.25;
@@ -58,16 +50,21 @@ function destination(
   distanceKm: number,
   bearingDeg: number
 ): Location {
-  const angularDistance = distanceKm / EARTH_RADIUS_KM;
-  const bearing = (bearingDeg * Math.PI) / 180;
+  const angularDistance =
+    distanceKm / EARTH_RADIUS_KM;
+
+  const bearing =
+    (bearingDeg * Math.PI) / 180;
 
   const latitude1 =
     (origin.latitude * Math.PI) / 180;
+
   const longitude1 =
     (origin.longitude * Math.PI) / 180;
 
   const latitude2 = Math.asin(
-    Math.sin(latitude1) * Math.cos(angularDistance) +
+    Math.sin(latitude1) *
+      Math.cos(angularDistance) +
       Math.cos(latitude1) *
         Math.sin(angularDistance) *
         Math.cos(bearing)
@@ -80,7 +77,8 @@ function destination(
         Math.sin(angularDistance) *
         Math.cos(latitude1),
       Math.cos(angularDistance) -
-        Math.sin(latitude1) * Math.sin(latitude2)
+        Math.sin(latitude1) *
+          Math.sin(latitude2)
     );
 
   return {
@@ -97,15 +95,14 @@ function makeWaypoints(
   rotationDeg: number,
   shape: number
 ): Location[] {
-  const bearingsByShape = [
+  const shapes = [
     [0, 120, 240],
     [0, 90, 210],
     [0, 145, 235],
     [0, 105, 225],
   ];
 
-  const bearings =
-    bearingsByShape[shape % bearingsByShape.length];
+  const bearings = shapes[shape % shapes.length];
 
   return bearings.map((bearing, index) => {
     const adjustedRadius =
@@ -143,7 +140,9 @@ async function mapWithConcurrency<T, R>(
 
   await Promise.all(
     Array.from(
-      { length: Math.min(concurrency, items.length) },
+      {
+        length: Math.min(concurrency, items.length),
+      },
       () => runWorker()
     )
   );
@@ -160,6 +159,7 @@ function distanceBetween(
 
   const lat1 = toRadians(a[1]);
   const lat2 = toRadians(b[1]);
+
   const deltaLat = lat2 - lat1;
   const deltaLon = toRadians(b[0] - a[0]);
 
@@ -177,34 +177,40 @@ function distanceBetween(
 }
 
 /**
- * Estimates route self-overlap by checking whether points that are
- * far apart along the route pass very close to each other.
- * This is a lightweight heuristic, not a full road-segment matcher.
+ * Resamples the route to at most approximately 300 points,
+ * then estimates overlap between non-adjacent route sections.
+ * This is a heuristic, not a road-segment comparison.
  */
-
 function calculateOverlapPenalty(
   coordinates: Coordinate[]
 ): number {
-  if (coordinates.length < 12) return 0;
-
-  // Resample by distance so dense sections of the polyline
-  // do not receive more weight than sparse sections.
-  const sampleSpacingKm = 0.04;
-  const closeDistanceKm = 0.02;
-  const minSeparationKm = 0.15;
-  const startFinishIgnoreKm = 0.25;
+  if (coordinates.length < 12) {
+    return 0;
+  }
 
   const cumulative: number[] = [0];
 
   for (let i = 1; i < coordinates.length; i++) {
     cumulative.push(
       cumulative[i - 1] +
-        distanceBetween(coordinates[i - 1], coordinates[i])
+        distanceBetween(
+          coordinates[i - 1],
+          coordinates[i]
+        )
     );
   }
 
-  const totalKm = cumulative[cumulative.length - 1];
-  if (totalKm <= 0) return 0;
+  const totalKm =
+    cumulative[cumulative.length - 1];
+
+  if (totalKm <= 0) {
+    return 0;
+  }
+
+  const spacingKm = Math.max(
+    0.05,
+    totalKm / 300
+  );
 
   const samples: Array<{
     point: Coordinate;
@@ -216,7 +222,7 @@ function calculateOverlapPenalty(
   for (
     let alongKm = 0;
     alongKm < totalKm;
-    alongKm += sampleSpacingKm
+    alongKm += spacingKm
   ) {
     while (
       segment < cumulative.length - 1 &&
@@ -227,7 +233,9 @@ function calculateOverlapPenalty(
 
     const segmentStart = cumulative[segment - 1];
     const segmentEnd = cumulative[segment];
-    const segmentLength = segmentEnd - segmentStart;
+
+    const segmentLength =
+      segmentEnd - segmentStart;
 
     const fraction =
       segmentLength > 0
@@ -246,16 +254,16 @@ function calculateOverlapPenalty(
     });
   }
 
-  let retracedSamples = 0;
+  let overlappingSamples = 0;
   let eligibleSamples = 0;
 
   for (let i = 0; i < samples.length; i++) {
     const current = samples[i];
 
-    // The route naturally begins and ends at the same place.
+    // Ignore the natural proximity of the start and finish.
     if (
-      current.alongKm < startFinishIgnoreKm ||
-      totalKm - current.alongKm < startFinishIgnoreKm
+      current.alongKm < 0.25 ||
+      totalKm - current.alongKm < 0.25
     ) {
       continue;
     }
@@ -264,35 +272,37 @@ function calculateOverlapPenalty(
 
     for (let j = 0; j < i; j++) {
       const previous = samples[j];
+
       const separationKm =
         current.alongKm - previous.alongKm;
 
-      // Ignore nearby points along the same continuous segment.
-      if (separationKm < minSeparationKm) continue;
+      if (separationKm < 0.15) {
+        continue;
+      }
 
-      // Ignore natural proximity between the start and finish.
       if (
-        previous.alongKm < startFinishIgnoreKm &&
-        totalKm - current.alongKm < startFinishIgnoreKm
+        previous.alongKm < 0.25 &&
+        totalKm - current.alongKm < 0.25
       ) {
         continue;
       }
 
       if (
-        distanceBetween(current.point, previous.point) <
-        closeDistanceKm
+        distanceBetween(
+          current.point,
+          previous.point
+        ) < 0.02
       ) {
-        retracedSamples++;
+        overlappingSamples++;
         break;
       }
     }
   }
 
   return eligibleSamples > 0
-    ? retracedSamples / eligibleSamples
+    ? overlappingSamples / eligibleSamples
     : 0;
 }
-
 
 function makeCandidateKey(
   radiusKm: number,
@@ -309,10 +319,14 @@ function makeCandidateKey(
 async function evaluateCandidate(
   start: Location,
   targetDistanceKm: number,
-  radiusKm: number,
-  rotationDeg: number,
-  shape: number
+  spec: CandidateSpec
 ): Promise<Candidate | null> {
+  const {
+    radiusKm,
+    rotationDeg,
+    shape,
+  } = spec;
+
   const waypoints = makeWaypoints(
     start,
     radiusKm,
@@ -320,21 +334,22 @@ async function evaluateCandidate(
     shape
   );
 
-  // One Valhalla request for the complete loop.
+  // Visit all three waypoints and return to the start.
   const stops = [start, ...waypoints, start];
 
   try {
-    const route = (await getRoute(
-      stops
-    )) as RouteResult;
+    const route = await getRoute(stops);
 
     if (
       !Number.isFinite(route.distance) ||
       route.distance <= 0 ||
+      !Number.isFinite(route.time) ||
       !Array.isArray(route.coordinates) ||
       route.coordinates.length < 2
     ) {
-      return null;
+      throw new Error(
+        "The routing service returned an invalid route."
+      );
     }
 
     const distanceErrorKm = Math.abs(
@@ -348,47 +363,57 @@ async function evaluateCandidate(
       radiusKm,
       rotationDeg: normalizeAngle(rotationDeg),
       shape,
-      waypoints,
       distanceKm: route.distance,
-      timeSeconds: route.time || 0,
+      timeSeconds: route.time,
       coordinates: route.coordinates,
       distanceErrorKm,
       overlapPenalty,
       score:
         distanceErrorKm +
-        overlapPenalty * targetDistanceKm * 0.25,
+        overlapPenalty * targetDistanceKm * 0.2,
     };
   } catch (error) {
-    console.warn("Route candidate failed:", error);
+    console.warn(
+      `[Route candidate failed] ` +
+        `radius=${radiusKm.toFixed(2)} km, ` +
+        `rotation=${rotationDeg}, shape=${shape}:`,
+      error instanceof Error
+        ? error.message
+        : error
+    );
+
     return null;
   }
 }
 
 function rankCandidates(
-  candidates: Candidate[]
+  candidates: Candidate[],
+  targetDistanceKm: number
 ): Candidate[] {
   return [...candidates].sort((a, b) => {
     const aWithinTolerance =
       a.distanceErrorKm <=
-      a.distanceKm * TARGET_TOLERANCE;
+      targetDistanceKm * TARGET_TOLERANCE;
 
     const bWithinTolerance =
       b.distanceErrorKm <=
-      b.distanceKm * TARGET_TOLERANCE;
+      targetDistanceKm * TARGET_TOLERANCE;
 
-    // Prefer an acceptable-distance route over one outside tolerance.
     if (aWithinTolerance !== bWithinTolerance) {
       return aWithinTolerance ? -1 : 1;
     }
 
-    // For similarly accurate routes, prefer less overlap.
+    // Prefer shorter distance error when the difference
+    // between errors is meaningful.
     if (
-      Math.abs(a.distanceErrorKm - b.distanceErrorKm) >
-      0.15
+      Math.abs(
+        a.distanceErrorKm - b.distanceErrorKm
+      ) > 0.05
     ) {
       return a.distanceErrorKm - b.distanceErrorKm;
     }
 
+    // Otherwise, prefer the route with less overlap.
     return a.score - b.score;
   });
 }
@@ -396,38 +421,43 @@ function rankCandidates(
 function buildInitialCandidates(
   targetDistanceKm: number
 ): CandidateSpec[] {
-  // This estimates a starting radius; actual road distances are
-  // measured and corrected during the adaptive search.
+  // Initial estimate only. Actual road distance is measured
+  // by Valhalla for every candidate.
   const baseRadius = clamp(
-    targetDistanceKm / 5,
+    targetDistanceKm / 7,
     MIN_RADIUS_KM,
     MAX_RADIUS_KM
   );
 
   const radiusFactors = [
     0.65,
-    0.9,
-    1.15,
-    1.45,
+    0.85,
+    1.05,
+    1.25,
+    1.5,
     1.8,
-    2.2,
   ];
 
-  const rotations = [0, 45, 90, 135];
+  const rotations = [
+    0,
+    45,
+    90,
+    135,
+    180,
+    225,
+  ];
 
   return radiusFactors
-    .flatMap((factor, radiusIndex) =>
-      rotations.map((rotationDeg, rotationIndex) => ({
-        radiusKm: clamp(
-          baseRadius * factor,
-          MIN_RADIUS_KM,
-          MAX_RADIUS_KM
-        ),
-        rotationDeg,
-        shape: (radiusIndex + rotationIndex) % 4,
-      }))
-    )
-    .slice(0, INITIAL_CANDIDATES);
+    .slice(0, INITIAL_CANDIDATES)
+    .map((factor, index) => ({
+      radiusKm: clamp(
+        baseRadius * factor,
+        MIN_RADIUS_KM,
+        MAX_RADIUS_KM
+      ),
+      rotationDeg: rotations[index],
+      shape: index % 4,
+    }));
 }
 
 function buildAdaptiveCandidates(
@@ -448,17 +478,20 @@ function buildAdaptiveCandidates(
     rotationDeg: number,
     shape: number
   ): void {
-    const radius = clamp(
-      radiusKm,
-      MIN_RADIUS_KM,
-      MAX_RADIUS_KM
-    );
+    const spec: CandidateSpec = {
+      radiusKm: clamp(
+        radiusKm,
+        MIN_RADIUS_KM,
+        MAX_RADIUS_KM
+      ),
+      rotationDeg: normalizeAngle(rotationDeg),
+      shape: ((shape % 4) + 4) % 4,
+    };
 
-    const rotation = normalizeAngle(rotationDeg);
     const key = makeCandidateKey(
-      radius,
-      rotation,
-      shape
+      spec.radiusKm,
+      spec.rotationDeg,
+      spec.shape
     );
 
     if (
@@ -475,84 +508,37 @@ function buildAdaptiveCandidates(
       return;
     }
 
-    candidates.push({
-      radiusKm: radius,
-      rotationDeg: rotation,
-      shape,
-    });
+    candidates.push(spec);
   }
 
-  // Damp the correction because radius and road distance are
-  // not linearly related.
-  const ratio = targetDistanceKm / best.distanceKm;
+  // Adjust the radius in the direction suggested by the
+  // best measured route. The square root damps corrections.
+  const ratio =
+    targetDistanceKm / best.distanceKm;
+
   const correction = clamp(
     Math.sqrt(ratio),
     0.7,
     1.4
   );
 
-  // Try the corrected radius, then probe both sides of it.
   add(
     best.radiusKm * correction,
     best.rotationDeg,
     best.shape
   );
 
-  const allTooLong = ranked.every(
-    (candidate) =>
-      candidate.distanceKm > targetDistanceKm
+  add(
+    best.radiusKm * correction * 0.85,
+    best.rotationDeg + 30,
+    (best.shape + 1) % 4
   );
-
-  const allTooShort = ranked.every(
-    (candidate) =>
-      candidate.distanceKm < targetDistanceKm
-  );
-
-  if (allTooLong) {
-    add(
-      best.radiusKm * 0.7,
-      best.rotationDeg,
-      (best.shape + 1) % 4
-    );
-  } else if (allTooShort) {
-    add(
-      best.radiusKm * 1.3,
-      best.rotationDeg,
-      (best.shape + 1) % 4
-    );
-  } else {
-    add(
-      best.radiusKm * 0.85,
-      best.rotationDeg,
-      (best.shape + 1) % 4
-    );
-  }
 
   add(
-    best.radiusKm * 1.15,
-    best.rotationDeg,
+    best.radiusKm * correction * 1.15,
+    best.rotationDeg + 60,
     (best.shape + 2) % 4
   );
-
-  // Explore a different orientation from another strong candidate.
-  const alternative = ranked.find(
-    (candidate) =>
-      candidate.rotationDeg !== best.rotationDeg
-  );
-
-  if (alternative) {
-    add(
-      alternative.radiusKm,
-      alternative.rotationDeg + 30,
-      (alternative.shape + 1) % 4
-    );
-  } else {
-    add(
-      best.radiusKm * correction,
-      best.rotationDeg + 45,
-      (best.shape + 1) % 4
-    );
-  }
 
   return candidates.slice(
     0,
@@ -581,7 +567,8 @@ export async function generateLoop(
     targetDistanceKm > MAX_TARGET_KM
   ) {
     throw new Error(
-      `Distance must be between ${MIN_TARGET_KM} and ${MAX_TARGET_KM} km.`
+      `Distance must be between ${MIN_TARGET_KM} ` +
+        `and ${MAX_TARGET_KM} km.`
     );
   }
 
@@ -602,7 +589,6 @@ export async function generateLoop(
         return false;
       }
 
-      // Mark attempted here, not when constructing adaptive specs.
       attempted.add(key);
       return true;
     });
@@ -614,9 +600,7 @@ export async function generateLoop(
         evaluateCandidate(
           start,
           targetDistanceKm,
-          spec.radiusKm,
-          spec.rotationDeg,
-          spec.shape
+          spec
         )
     );
 
@@ -626,24 +610,28 @@ export async function generateLoop(
     );
   }
 
-  evaluated = await evaluateBatch(
-    buildInitialCandidates(targetDistanceKm)
-  );
+  const initialSpecs =
+    buildInitialCandidates(targetDistanceKm);
+
+  evaluated = await evaluateBatch(initialSpecs);
 
   if (evaluated.length === 0) {
     throw new Error(
-      "Could not generate a valid route. Try another starting location."
+      "All route candidates failed. Check the backend " +
+        "logs for the Valhalla error, then try again."
     );
   }
 
-  let best = rankCandidates(evaluated)[0];
+  let best = rankCandidates(
+    evaluated,
+    targetDistanceKm
+  )[0];
 
   for (
     let round = 0;
     round < MAX_ADAPTIVE_ROUNDS;
     round++
   ) {
-    // Stop early when the best distance is within 3%.
     if (
       best.distanceErrorKm <=
       targetDistanceKm * TARGET_TOLERANCE
@@ -653,7 +641,7 @@ export async function generateLoop(
 
     const nextSpecs = buildAdaptiveCandidates(
       targetDistanceKm,
-      rankCandidates(evaluated),
+      rankCandidates(evaluated, targetDistanceKm),
       attempted
     );
 
@@ -661,14 +649,22 @@ export async function generateLoop(
       break;
     }
 
-    const nextResults = await evaluateBatch(nextSpecs);
+    const nextResults =
+      await evaluateBatch(nextSpecs);
 
     if (nextResults.length === 0) {
+      console.warn(
+        "Adaptive search produced no valid new candidates."
+      );
       break;
     }
 
     evaluated = [...evaluated, ...nextResults];
-    best = rankCandidates(evaluated)[0];
+
+    best = rankCandidates(
+      evaluated,
+      targetDistanceKm
+    )[0];
   }
 
   const withinTolerance =

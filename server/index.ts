@@ -1,4 +1,4 @@
-
+import "dotenv/config";
 import http from "node:http";
 import { generateLoop } from "./routing/routeGenerator";
 

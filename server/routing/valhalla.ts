@@ -1,4 +1,3 @@
-import polyline from "@mapbox/polyline";
 
 export type Location = {
   latitude: number;
@@ -11,32 +10,56 @@ export type RouteResult = {
   coordinates: [number, number][];
 };
 
-type ValhallaResponse = {
-  trip?: {
-    status?: number;
-    status_message?: string;
-    summary?: {
-      length?: number;
-      time?: number;
+type GraphHopperResponse = {
+  message?: string;
+  paths?: Array<{
+    distance?: number;
+    time?: number;
+    points?: {
+      type?: string;
+      coordinates?: number[][];
     };
-    legs?: Array<{
-      shape?: string;
-    }>;
-  };
+  }>;
 };
 
-const VALHALLA_URL =
-  "https://valhalla1.openstreetmap.de/route";
+const GRAPHHOPPER_URL =
+  "https://graphhopper.com/api/1/route";
 
 const REQUEST_TIMEOUT_MS = 15_000;
+const REQUEST_INTERVAL_MS = 1_100;
 
-export async function getRoute(
-  locations: Location[]
-): Promise<RouteResult> {
+// Space out requests from this Node.js process.
+let requestQueue: Promise<void> = Promise.resolve();
+let nextRequestAt = 0;
+
+async function waitForRequestSlot(): Promise<void> {
+  let release!: () => void;
+  const previous = requestQueue;
+
+  requestQueue = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  await previous;
+
+  try {
+    const delay = Math.max(0, nextRequestAt - Date.now());
+
+    if (delay > 0) {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, delay);
+      });
+    }
+
+    nextRequestAt = Date.now() + REQUEST_INTERVAL_MS;
+  } finally {
+    release();
+  }
+}
+
+function validateLocations(locations: Location[]): void {
   if (locations.length < 2) {
-    throw new Error(
-      "At least two locations are required."
-    );
+    throw new Error("At least two locations are required.");
   }
 
   for (const location of locations) {
@@ -51,6 +74,36 @@ export async function getRoute(
       throw new Error("Invalid waypoint coordinates.");
     }
   }
+}
+
+export async function getRoute(
+  locations: Location[]
+): Promise<RouteResult> {
+  validateLocations(locations);
+
+  const apiKey = process.env.GRAPHHOPPER_API_KEY;
+
+  if (!apiKey) {
+    throw new Error(
+      "GRAPHHOPPER_API_KEY is missing. Check your .env file."
+    );
+  }
+
+  await waitForRequestSlot();
+
+  const url = new URL(GRAPHHOPPER_URL);
+
+  for (const location of locations) {
+    // GraphHopper GET points use latitude,longitude.
+    url.searchParams.append(
+      "point",
+      `${location.latitude},${location.longitude}`
+    );
+  }
+
+  url.searchParams.set("profile", "foot");
+  url.searchParams.set("points_encoded", "false");
+  url.searchParams.set("key", apiKey);
 
   const controller = new AbortController();
 
@@ -60,129 +113,112 @@ export async function getRoute(
   );
 
   try {
-    const response = await fetch(VALHALLA_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
+    const response = await fetch(url, {
+      method: "GET",
       signal: controller.signal,
-      body: JSON.stringify({
-        locations: locations.map((location) => ({
-          lat: location.latitude,
-          lon: location.longitude,
-        })),
-        costing: "pedestrian",
-        units: "kilometers",
-        shape_format: "polyline6",
-      }),
     });
 
+    const responseText = await response.text();
+
     if (!response.ok) {
+      let message = responseText.slice(0, 500);
+
+      try {
+        const errorData = JSON.parse(responseText) as {
+          message?: string;
+        };
+
+        if (errorData.message) {
+          message = errorData.message;
+        }
+      } catch {
+        // Keep the original response text.
+      }
+
       throw new Error(
-        `Valhalla returned HTTP ${response.status}.`
+        `GraphHopper returned HTTP ${response.status}: ${message}`
       );
     }
 
-    const data =
-      (await response.json()) as ValhallaResponse;
+    const data = JSON.parse(
+      responseText
+    ) as GraphHopperResponse;
 
-    const trip = data.trip;
+    const path = data.paths?.[0];
 
-    if (!trip) {
-      throw new Error("Valhalla did not return a trip.");
-    }
-
-    if (trip.status && trip.status !== 0) {
+    if (!path) {
       throw new Error(
-        trip.status_message ??
-          `Valhalla routing failed with status ${trip.status}.`
-      );
-    }
-
-    const distance = trip.summary?.length;
-    const time = trip.summary?.time;
-
-    if (
-      typeof distance !== "number" ||
-      !Number.isFinite(distance) ||
-      distance <= 0
-    ) {
-      throw new Error(
-        "Valhalla returned an invalid route distance."
+        "GraphHopper returned no route."
       );
     }
 
     if (
-      typeof time !== "number" ||
-      !Number.isFinite(time) ||
-      time < 0
+      typeof path.distance !== "number" ||
+      !Number.isFinite(path.distance) ||
+      path.distance <= 0
     ) {
       throw new Error(
-        "Valhalla returned an invalid route duration."
+        "GraphHopper returned an invalid route distance."
       );
     }
 
-    if (!trip.legs || trip.legs.length === 0) {
+    if (
+      typeof path.time !== "number" ||
+      !Number.isFinite(path.time) ||
+      path.time < 0
+    ) {
       throw new Error(
-        "Valhalla returned no route legs."
+        "GraphHopper returned an invalid route duration."
+      );
+    }
+
+    const rawCoordinates = path.points?.coordinates;
+
+    if (
+      !Array.isArray(rawCoordinates) ||
+      rawCoordinates.length < 2
+    ) {
+      throw new Error(
+        "GraphHopper returned insufficient route geometry."
       );
     }
 
     const coordinates: [number, number][] = [];
 
-    for (const leg of trip.legs) {
-      if (!leg.shape) {
+    for (const point of rawCoordinates) {
+      const [longitude, latitude] = point;
+
+      if (
+        !Number.isFinite(longitude) ||
+        !Number.isFinite(latitude) ||
+        longitude < -180 ||
+        longitude > 180 ||
+        latitude < -90 ||
+        latitude > 90
+      ) {
         throw new Error(
-          "Valhalla returned a leg without geometry."
+          "GraphHopper returned invalid route coordinates."
         );
       }
 
-      const decoded = polyline.decode(leg.shape, 6);
-
-      for (const [latitude, longitude] of decoded) {
-        if (
-          !Number.isFinite(latitude) ||
-          !Number.isFinite(longitude)
-        ) {
-          throw new Error(
-            "Valhalla returned invalid route coordinates."
-          );
-        }
-
-        const point: [number, number] = [
-          longitude,
-          latitude,
-        ];
-
-        const previous =
-          coordinates[coordinates.length - 1];
-
-        // Avoid duplicating shared endpoints between legs.
-        if (
-          !previous ||
-          previous[0] !== point[0] ||
-          previous[1] !== point[1]
-        ) {
-          coordinates.push(point);
-        }
-      }
-    }
-
-    if (coordinates.length < 2) {
-      throw new Error(
-        "Valhalla returned insufficient route geometry."
-      );
+      // GraphHopper already provides [longitude, latitude],
+      // which is also the format MapLibre expects.
+      coordinates.push([longitude, latitude]);
     }
 
     return {
-      distance,
-      time,
+      // GraphHopper distance is in meters; our app uses km.
+      distance: path.distance / 1000,
+
+      // GraphHopper time is in milliseconds; our app uses seconds.
+      time: path.time / 1000,
+
       coordinates,
     };
   } catch (error) {
     if (controller.signal.aborted) {
       throw new Error(
-        "Valhalla routing request timed out."
+        "GraphHopper routing request timed out."
       );
     }
 
