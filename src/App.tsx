@@ -8,16 +8,53 @@ interface Location {
 }
 
 interface Route {
+  id: number;
   distance: number;
   time: number;
   coordinates: [number, number][];
+  targetDistance?: number;
+  distanceError?: number;
+  withinTolerance?: boolean;
+}
+
+function isValidRoute(value: unknown): value is Route {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const route = value as Record<string, unknown>;
+
+  return (
+    typeof route.id === "number" &&
+    Number.isFinite(route.id) &&
+    typeof route.distance === "number" &&
+    Number.isFinite(route.distance) &&
+    route.distance > 0 &&
+    typeof route.time === "number" &&
+    Number.isFinite(route.time) &&
+    Array.isArray(route.coordinates) &&
+    route.coordinates.length >= 2 &&
+    route.coordinates.every(
+      (coordinate) =>
+        Array.isArray(coordinate) &&
+        coordinate.length >= 2 &&
+        typeof coordinate[0] === "number" &&
+        Number.isFinite(coordinate[0]) &&
+        typeof coordinate[1] === "number" &&
+        Number.isFinite(coordinate[1]) &&
+        coordinate[0] >= -180 &&
+        coordinate[0] <= 180 &&
+        coordinate[1] >= -90 &&
+        coordinate[1] <= 90,
+    )
+  );
 }
 
 function App() {
   const [distance, setDistance] = useState(10);
   const [startLocation, setStartLocation] = useState<Location | null>(null);
 
-  const [route, setRoute] = useState<Route | null>(null);
+  const [routes, setRoutes] = useState<Route[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -34,6 +71,7 @@ function App() {
 
     setIsGenerating(true);
     setError(null);
+    setRoutes([]);
 
     try {
       const response = await fetch("http://localhost:3000/api/route", {
@@ -47,34 +85,58 @@ function App() {
         }),
       });
 
-      const data = await response.json();
+      const data: unknown = await response.json();
 
       if (!response.ok) {
-        throw new Error(
+        const message =
+          typeof data === "object" &&
+          data !== null &&
+          "error" in data &&
           typeof data.error === "string"
             ? data.error
-            : "Failed to generate route.",
-        );
+            : "Failed to generate routes.";
+
+        throw new Error(message);
       }
 
       if (
-        !Number.isFinite(data.distance) ||
-        !Number.isFinite(data.time) ||
-        !Array.isArray(data.coordinates) ||
-        data.coordinates.length < 2
+        typeof data !== "object" ||
+        data === null ||
+        !("routes" in data) ||
+        !Array.isArray(data.routes)
       ) {
-        throw new Error("The server returned an invalid route.");
+        throw new Error("The server returned an invalid routes response.");
       }
 
-      setRoute(data as Route);
+      const validRoutes = data.routes.filter(isValidRoute);
 
-      console.log("Route received:", {
-        requestedDistanceKm: distance,
-        actualDistanceKm: data.distance,
-        differenceKm: Math.abs(data.distance - distance),
-      });
+      if (validRoutes.length === 0) {
+        throw new Error(
+          "No valid routes were returned. Try another starting point.",
+        );
+      }
+
+      setRoutes(validRoutes);
+
+      console.log(
+        "Routes received:",
+        validRoutes.map((route, index) => ({
+          option: index + 1,
+          distanceKm: route.distance,
+          differenceKm: Math.abs(route.distance - distance),
+          timeMinutes: Math.round(route.time / 60),
+        })),
+      );
+
+      if (validRoutes.length < 3) {
+        console.warn(
+          `Only ${validRoutes.length} valid route option(s) were returned.`,
+        );
+      }
     } catch (error) {
       console.error("Route generation failed:", error);
+
+      setRoutes([]);
 
       setError(
         error instanceof Error
@@ -91,7 +153,7 @@ function App() {
       <RouteMap
         startLocation={startLocation}
         onStartLocationChange={setStartLocation}
-        route={route}
+        routes={routes}
       />
 
       <RouteControls

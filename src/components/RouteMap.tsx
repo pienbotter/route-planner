@@ -1,5 +1,4 @@
 import { useEffect, useRef } from "react";
-
 import {
   Map,
   Marker,
@@ -7,11 +6,8 @@ import {
   setWorkerUrl,
   type GeoJSONSource,
 } from "maplibre-gl";
-
 import workerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
 import "maplibre-gl/dist/maplibre-gl.css";
-
-setWorkerUrl(workerUrl);
 
 interface Location {
   latitude: number;
@@ -19,6 +15,7 @@ interface Location {
 }
 
 interface Route {
+  id: number;
   distance: number;
   time: number;
   coordinates: [number, number][];
@@ -27,162 +24,179 @@ interface Route {
 interface RouteMapProps {
   startLocation: Location | null;
   onStartLocationChange: (location: Location) => void;
-  route: Route | null;
+  routes: Route[];
 }
+
+const ROUTE_SOURCE_ID = "generated-routes";
+const ROUTE_LAYER_ID = "generated-routes-line";
 
 function RouteMap({
   startLocation,
   onStartLocationChange,
-  route,
+  routes,
 }: RouteMapProps) {
-  const mapContainer = useRef<HTMLDivElement>(null);
-  const map = useRef<Map | null>(null);
-  const marker = useRef<Marker | null>(null);
+  const mapContainer = useRef<HTMLDivElement | null>(null);
+  const mapRef = useRef<Map | null>(null);
+  const markerRef = useRef<Marker | null>(null);
 
-  // Initialize the map once and clean it up on unmount.
+  // Initialize the map once.
   useEffect(() => {
-    if (!mapContainer.current) {
+    if (!mapContainer.current || mapRef.current) {
       return;
     }
 
-    const mapInstance = new Map({
+    setWorkerUrl(workerUrl);
+
+    const map = new Map({
       container: mapContainer.current,
       center: [4.9, 52.37],
       zoom: 11,
       style: "https://tiles.openfreemap.org/styles/liberty",
     });
 
-    map.current = mapInstance;
+    mapRef.current = map;
 
-    const handleMapClick = (event: {
-      lngLat: { lng: number; lat: number };
-    }) => {
+    map.on("click", (event) => {
       onStartLocationChange({
         latitude: event.lngLat.lat,
         longitude: event.lngLat.lng,
       });
-    };
-
-    mapInstance.on("click", handleMapClick);
+    });
 
     return () => {
-      mapInstance.off("click", handleMapClick);
+      markerRef.current?.remove();
+      markerRef.current = null;
 
-      marker.current?.remove();
-      marker.current = null;
-
-      mapInstance.remove();
-      map.current = null;
+      map.remove();
+      mapRef.current = null;
     };
   }, [onStartLocationChange]);
 
-  // Keep the starting-point marker synchronized with state.
+  // Keep the start marker in sync with the selected location.
   useEffect(() => {
-    const mapInstance = map.current;
+    const map = mapRef.current;
 
-    if (!mapInstance || !startLocation) {
+    if (!map || !startLocation) {
+      markerRef.current?.remove();
+      markerRef.current = null;
       return;
     }
 
-    const coordinates: [number, number] = [
-      startLocation.longitude,
-      startLocation.latitude,
-    ];
-
-    if (marker.current) {
-      marker.current.setLngLat(coordinates);
+    if (!markerRef.current) {
+      markerRef.current = new Marker({
+        color: "#111827",
+      })
+        .setLngLat([startLocation.longitude, startLocation.latitude])
+        .addTo(map);
     } else {
-      marker.current = new Marker().setLngLat(coordinates).addTo(mapInstance);
+      markerRef.current.setLngLat([
+        startLocation.longitude,
+        startLocation.latitude,
+      ]);
     }
   }, [startLocation]);
 
-  // Draw the latest generated route.
+  // Draw all available routes in different colors.
   useEffect(() => {
-    const mapInstance = map.current;
+    const map = mapRef.current;
 
-    if (
-      !mapInstance ||
-      !route ||
-      !Array.isArray(route.coordinates) ||
-      route.coordinates.length < 2
-    ) {
+    if (!map) {
       return;
     }
 
-    const sourceId = "generated-route";
-    const layerId = "generated-route-line";
-
-    let cancelled = false;
-
-    const geojson = {
-      type: "Feature" as const,
-      properties: {},
-      geometry: {
-        type: "LineString" as const,
-        coordinates: route.coordinates,
-      },
-    };
-
-    const addOrUpdateRoute = () => {
-      if (cancelled || !mapInstance.isStyleLoaded()) {
+    const updateRoutes = () => {
+      if (mapRef.current !== map) {
         return;
       }
 
-      const existingSource = mapInstance.getSource(sourceId);
+      const featureCollection = {
+        type: "FeatureCollection" as const,
+        features: routes.map((route, index) => ({
+          type: "Feature" as const,
+          properties: {
+            routeId: index + 1,
+          },
+          geometry: {
+            type: "LineString" as const,
+            coordinates: route.coordinates,
+          },
+        })),
+      };
+
+      const existingSource = map.getSource(ROUTE_SOURCE_ID) as
+        | GeoJSONSource
+        | undefined;
 
       if (existingSource) {
-        (existingSource as GeoJSONSource).setData(geojson);
+        existingSource.setData(featureCollection);
       } else {
-        mapInstance.addSource(sourceId, {
+        map.addSource(ROUTE_SOURCE_ID, {
           type: "geojson",
-          data: geojson,
+          data: featureCollection,
         });
 
-        mapInstance.addLayer({
-          id: layerId,
+        map.addLayer({
+          id: ROUTE_LAYER_ID,
           type: "line",
-          source: sourceId,
+          source: ROUTE_SOURCE_ID,
           layout: {
-            "line-join": "round",
             "line-cap": "round",
+            "line-join": "round",
           },
           paint: {
+            "line-color": [
+              "match",
+              ["get", "routeId"],
+              1,
+              "#2563eb",
+              2,
+              "#f97316",
+              3,
+              "#16a34a",
+              "#9333ea",
+            ],
             "line-width": 5,
-            "line-color": "#2563eb",
             "line-opacity": 0.9,
           },
         });
       }
 
-      const bounds = new LngLatBounds();
-
-      for (const coordinate of route.coordinates) {
-        bounds.extend(coordinate);
+      if (routes.length === 0) {
+        return;
       }
 
-      mapInstance.fitBounds(bounds, {
-        padding: {
-          top: 80,
-          bottom: 60,
-          left: 330,
-          right: 40,
-        },
-        maxZoom: 15,
-        duration: 700,
-      });
+      const bounds = new LngLatBounds();
+
+      for (const route of routes) {
+        for (const coordinate of route.coordinates) {
+          bounds.extend(coordinate);
+        }
+      }
+
+      if (!bounds.isEmpty()) {
+        map.fitBounds(bounds, {
+          padding: {
+            top: 80,
+            bottom: 60,
+            left: 330,
+            right: 40,
+          },
+          maxZoom: 15,
+          duration: 700,
+        });
+      }
     };
 
-    if (mapInstance.isStyleLoaded()) {
-      addOrUpdateRoute();
+    if (map.isStyleLoaded()) {
+      updateRoutes();
     } else {
-      mapInstance.once("load", addOrUpdateRoute);
+      map.once("load", updateRoutes);
     }
 
     return () => {
-      cancelled = true;
-      mapInstance.off("load", addOrUpdateRoute);
+      map.off("load", updateRoutes);
     };
-  }, [route]);
+  }, [routes]);
 
   return (
     <div

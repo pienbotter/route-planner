@@ -1,9 +1,9 @@
+
 import "dotenv/config";
 import http from "node:http";
 import { generateLoop } from "./routing/routeGenerator";
 
 const PORT = Number(process.env.PORT ?? 3000);
-
 const ALLOWED_ORIGIN =
   process.env.ALLOWED_ORIGIN ?? "http://localhost:5173";
 
@@ -29,7 +29,7 @@ function sendJson(
     "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
-    "Cache-Control": "no-store",
+    "Vary": "Origin",
   });
 
   res.end(JSON.stringify(data));
@@ -38,10 +38,7 @@ function sendJson(
 function isValidRouteRequest(
   value: unknown
 ): value is RouteRequest {
-  if (
-    typeof value !== "object" ||
-    value === null
-  ) {
+  if (typeof value !== "object" || value === null) {
     return false;
   }
 
@@ -77,80 +74,78 @@ function isValidRouteRequest(
   );
 }
 
-const server = http.createServer((req, res) => {
-  // Handle CORS preflight requests.
+function readRequestBody(
+  req: http.IncomingMessage
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    let bodySize = 0;
+    let tooLarge = false;
+
+    req.setEncoding("utf8");
+
+    req.on("data", (chunk: string) => {
+      bodySize += Buffer.byteLength(chunk);
+
+      if (bodySize > MAX_BODY_SIZE) {
+        tooLarge = true;
+        return;
+      }
+
+      body += chunk;
+    });
+
+    req.on("end", () => {
+      if (tooLarge) {
+        reject(new Error("Request body is too large."));
+        return;
+      }
+
+      resolve(body);
+    });
+
+    req.on("error", reject);
+  });
+}
+
+const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type",
-      "Access-Control-Max-Age": "86400",
+      "Vary": "Origin",
     });
 
     res.end();
     return;
   }
 
-  // Reject requests from unexpected browser origins.
-  const origin = req.headers.origin;
-
-  if (origin && origin !== ALLOWED_ORIGIN) {
-    sendJson(res, 403, {
-      error: "Origin not allowed.",
-    });
-    return;
-  }
-
-  const url = new URL(
+  const requestUrl = new URL(
     req.url ?? "/",
     `http://${req.headers.host ?? "localhost"}`
   );
 
-  // Health check.
   if (
     req.method === "GET" &&
-    url.pathname === "/api/health"
+    requestUrl.pathname === "/api/health"
   ) {
-    sendJson(res, 200, {
-      status: "ok",
-    });
+    sendJson(res, 200, { status: "ok" });
     return;
   }
 
-  // Route endpoint.
   if (
     req.method !== "POST" ||
-    url.pathname !== "/api/route"
+    requestUrl.pathname !== "/api/route"
   ) {
     sendJson(res, 404, {
-      error: "Not found.",
+      error: "Endpoint not found.",
     });
     return;
   }
 
-  let body = "";
-  let bodyTooLarge = false;
-
-  req.on("data", (chunk: Buffer) => {
-    if (bodyTooLarge) {
-      return;
-    }
-
-    body += chunk.toString("utf8");
-
-    if (Buffer.byteLength(body, "utf8") > MAX_BODY_SIZE) {
-      bodyTooLarge = true;
-      body = "";
-    }
-  });
-
-  req.on("end", async () => {
-    if (bodyTooLarge) {
-      sendJson(res, 413, {
-        error: "Request body too large.",
-      });
-      return;
-    }
+  try {
+    const body = await readRequestBody(req);
 
     let data: unknown;
 
@@ -158,7 +153,7 @@ const server = http.createServer((req, res) => {
       data = JSON.parse(body);
     } catch {
       sendJson(res, 400, {
-        error: "Request body must be valid JSON.",
+        error: "Request body must contain valid JSON.",
       });
       return;
     }
@@ -166,48 +161,37 @@ const server = http.createServer((req, res) => {
     if (!isValidRouteRequest(data)) {
       sendJson(res, 400, {
         error:
-          "Provide valid start coordinates and a distance between 1 and 100 km.",
+          "Provide a valid starting location and a distance " +
+          "between 1 and 100 km.",
       });
       return;
     }
 
-    try {
-      console.log(
-        `Generating ${data.distance} km route from`,
-        data.start
-      );
+    const result = await generateLoop(
+      data.start,
+      data.distance
+    );
 
-      const route = await generateLoop(
-        data.start,
-        data.distance
-      );
+    console.log(
+      `Generated ${result.routes.length} route option(s) ` +
+        `for a ${data.distance.toFixed(2)} km target.`
+    );
 
-      console.log(
-        `Route generated: ${route.distance.toFixed(2)} km`
-      );
+    sendJson(res, 200, result);
+  } catch (error) {
+    const message =
+      error instanceof Error
+        ? error.message
+        : "An unexpected server error occurred.";
 
-      sendJson(res, 200, route);
-    } catch (error) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : "An unexpected error occurred.";
+    console.error("Route request failed:", error);
 
-      console.error("Route generation failed:", message);
-
-      sendJson(res, 502, {
-        error: message,
-      });
-    }
-  });
-
-  req.on("error", (error) => {
-    console.error("Request error:", error);
-  });
+    sendJson(res, 502, {
+      error: message,
+    });
+  }
 });
 
 server.listen(PORT, () => {
-  console.log(
-    `Route server running at http://localhost:${PORT}`
-  );
+  console.log(`Route server listening on http://localhost:${PORT}`);
 });

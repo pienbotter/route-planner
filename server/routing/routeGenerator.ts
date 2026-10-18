@@ -1,3 +1,4 @@
+
 import { getRoute, Location } from "./valhalla";
 
 type Coordinate = [number, number];
@@ -33,6 +34,8 @@ const MAX_RADIUS_KM = 15;
 const MIN_TARGET_KM = 1;
 const MAX_TARGET_KM = 100;
 
+const MAX_RETURNED_ROUTES = 3;
+
 function clamp(
   value: number,
   min: number,
@@ -43,6 +46,14 @@ function clamp(
 
 function normalizeAngle(degrees: number): number {
   return ((degrees % 360) + 360) % 360;
+}
+
+function angleDifference(a: number, b: number): number {
+  const difference = Math.abs(
+    normalizeAngle(a) - normalizeAngle(b)
+  );
+
+  return Math.min(difference, 360 - difference);
 }
 
 function destination(
@@ -177,9 +188,8 @@ function distanceBetween(
 }
 
 /**
- * Resamples the route to at most approximately 300 points,
- * then estimates overlap between non-adjacent route sections.
- * This is a heuristic, not a road-segment comparison.
+ * Estimates how much a route overlaps itself.
+ * This is a heuristic, not a comparison of actual road segments.
  */
 function calculateOverlapPenalty(
   coordinates: Coordinate[]
@@ -403,8 +413,6 @@ function rankCandidates(
       return aWithinTolerance ? -1 : 1;
     }
 
-    // Prefer shorter distance error when the difference
-    // between errors is meaningful.
     if (
       Math.abs(
         a.distanceErrorKm - b.distanceErrorKm
@@ -413,16 +421,59 @@ function rankCandidates(
       return a.distanceErrorKm - b.distanceErrorKm;
     }
 
-    // Otherwise, prefer the route with less overlap.
     return a.score - b.score;
   });
+}
+
+/**
+ * Selects up to three highly ranked candidates while avoiding
+ * candidates with almost identical generation parameters.
+ *
+ * This improves variety, but cannot guarantee that every route
+ * uses different roads.
+ */
+function selectDistinctCandidates(
+  ranked: Candidate[]
+): Candidate[] {
+  const selected: Candidate[] = [];
+
+  for (const candidate of ranked) {
+    const tooSimilar = selected.some((existing) => {
+      const sameShape =
+        existing.shape === candidate.shape;
+
+      const similarRadius =
+        Math.abs(existing.radiusKm - candidate.radiusKm) <
+        Math.max(
+          0.2,
+          Math.min(existing.radiusKm, candidate.radiusKm) *
+            0.1
+        );
+
+      const similarRotation =
+        angleDifference(
+          existing.rotationDeg,
+          candidate.rotationDeg
+        ) < 25;
+
+      return sameShape && similarRadius && similarRotation;
+    });
+
+    if (!tooSimilar) {
+      selected.push(candidate);
+    }
+
+    if (selected.length >= MAX_RETURNED_ROUTES) {
+      break;
+    }
+  }
+
+  return selected;
 }
 
 function buildInitialCandidates(
   targetDistanceKm: number
 ): CandidateSpec[] {
-  // Initial estimate only. Actual road distance is measured
-  // by Valhalla for every candidate.
   const baseRadius = clamp(
     targetDistanceKm / 7,
     MIN_RADIUS_KM,
@@ -511,8 +562,6 @@ function buildAdaptiveCandidates(
     candidates.push(spec);
   }
 
-  // Adjust the radius in the direction suggested by the
-  // best measured route. The square root damps corrections.
   const ratio =
     targetDistanceKm / best.distanceKm;
 
@@ -618,14 +667,16 @@ export async function generateLoop(
   if (evaluated.length === 0) {
     throw new Error(
       "All route candidates failed. Check the backend " +
-        "logs for the Valhalla error, then try again."
+        "logs for the GraphHopper error, then try again."
     );
   }
 
-  let best = rankCandidates(
+  let ranked = rankCandidates(
     evaluated,
     targetDistanceKm
-  )[0];
+  );
+
+  let best = ranked[0];
 
   for (
     let round = 0;
@@ -641,7 +692,7 @@ export async function generateLoop(
 
     const nextSpecs = buildAdaptiveCandidates(
       targetDistanceKm,
-      rankCandidates(evaluated, targetDistanceKm),
+      ranked,
       attempted
     );
 
@@ -661,35 +712,38 @@ export async function generateLoop(
 
     evaluated = [...evaluated, ...nextResults];
 
-    best = rankCandidates(
+    ranked = rankCandidates(
       evaluated,
       targetDistanceKm
-    )[0];
+    );
+
+    best = ranked[0];
   }
 
-  const withinTolerance =
-    best.distanceErrorKm <=
-    targetDistanceKm * TARGET_TOLERANCE;
+  ranked = rankCandidates(evaluated, targetDistanceKm);
 
-  const errorPercent =
-    ((best.distanceKm - targetDistanceKm) /
-      targetDistanceKm) *
-    100;
+  const selected = selectDistinctCandidates(ranked);
+
+  const routes = selected.map((candidate, index) => ({
+    id: index + 1,
+    distance: candidate.distanceKm,
+    time: candidate.timeSeconds,
+    coordinates: candidate.coordinates,
+    targetDistance: targetDistanceKm,
+    distanceError: candidate.distanceErrorKm,
+    withinTolerance:
+      candidate.distanceErrorKm <=
+      targetDistanceKm * TARGET_TOLERANCE,
+  }));
 
   console.log(
     `Route target: ${targetDistanceKm.toFixed(2)} km; ` +
-      `actual: ${best.distanceKm.toFixed(2)} km; ` +
-      `difference: ${errorPercent.toFixed(1)}%; ` +
+      `best actual: ${best.distanceKm.toFixed(2)} km; ` +
       `candidates evaluated: ${evaluated.length}; ` +
-      `within 3%: ${withinTolerance}`
+      `routes returned: ${routes.length}; ` +
+      `best route within 3%: ` +
+      `${best.distanceErrorKm <= targetDistanceKm * TARGET_TOLERANCE}`
   );
 
-  return {
-    distance: best.distanceKm,
-    time: best.timeSeconds,
-    coordinates: best.coordinates,
-    targetDistance: targetDistanceKm,
-    distanceError: best.distanceErrorKm,
-    withinTolerance,
-  };
+  return { routes };
 }
