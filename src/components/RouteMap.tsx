@@ -1,5 +1,12 @@
 import { useEffect, useRef } from "react";
-import { Map, Marker, setWorkerUrl, type GeoJSONSource } from "maplibre-gl";
+import {
+  Map,
+  Marker,
+  LngLatBounds,
+  setWorkerUrl,
+  type GeoJSONSource,
+} from "maplibre-gl";
+
 import workerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
 import "maplibre-gl/dist/maplibre-gl.css";
 
@@ -32,49 +39,72 @@ function RouteMap({
   const marker = useRef<Marker | null>(null);
 
   useEffect(() => {
-    if (!mapContainer.current) return;
+    if (!mapContainer.current) {
+      return;
+    }
 
     const mapInstance = new Map({
       container: mapContainer.current,
-
       center: [4.9, 52.37],
       zoom: 11,
-
-      // Real OpenStreetMap-based vector map.
       style: "https://tiles.openfreemap.org/styles/liberty",
     });
 
     map.current = mapInstance;
 
-    mapInstance.on("click", (event) => {
+    const handleMapClick = (event: {
+      lngLat: { lng: number; lat: number };
+    }) => {
       const { lng, lat } = event.lngLat;
 
       onStartLocationChange({
         latitude: lat,
         longitude: lng,
       });
+    };
 
-      if (marker.current) {
-        marker.current.setLngLat([lng, lat]);
-      } else {
-        marker.current = new Marker().setLngLat([lng, lat]).addTo(mapInstance);
-      }
-    });
+    mapInstance.on("click", handleMapClick);
 
     return () => {
+      mapInstance.off("click", handleMapClick);
       marker.current?.remove();
+      marker.current = null;
+
       mapInstance.remove();
       map.current = null;
     };
   }, [onStartLocationChange]);
 
+  // Keep the start marker synchronized with React state.
   useEffect(() => {
-    if (!map.current || !route) return;
-
     const mapInstance = map.current;
 
-    const sourceId = "route";
-    const layerId = "route";
+    if (!mapInstance || !startLocation) {
+      return;
+    }
+
+    const coordinates: [number, number] = [
+      startLocation.longitude,
+      startLocation.latitude,
+    ];
+
+    if (marker.current) {
+      marker.current.setLngLat(coordinates);
+    } else {
+      marker.current = new Marker().setLngLat(coordinates).addTo(mapInstance);
+    }
+  }, [startLocation]);
+
+  // Display the latest route and fit the map to its bounds.
+  useEffect(() => {
+    const mapInstance = map.current;
+
+    if (!mapInstance || !route || route.coordinates.length < 2) {
+      return;
+    }
+
+    const sourceId = "generated-route";
+    const layerId = "generated-route-line";
 
     const geojson = {
       type: "Feature" as const,
@@ -85,8 +115,10 @@ function RouteMap({
       },
     };
 
-    const addRoute = () => {
-      if (!mapInstance.getSource(sourceId)) {
+    const addOrUpdateRoute = () => {
+      if (mapInstance.getSource(sourceId)) {
+        (mapInstance.getSource(sourceId) as GeoJSONSource).setData(geojson);
+      } else {
         mapInstance.addSource(sourceId, {
           type: "geojson",
           data: geojson,
@@ -101,46 +133,46 @@ function RouteMap({
             "line-cap": "round",
           },
           paint: {
-            "line-width": 6,
+            "line-width": 5,
             "line-color": "#2563eb",
             "line-opacity": 0.9,
           },
         });
-      } else {
-        (mapInstance.getSource(sourceId) as GeoJSONSource).setData(geojson);
       }
+
+      const bounds = new LngLatBounds();
+
+      for (const coordinate of route.coordinates) {
+        bounds.extend(coordinate);
+      }
+
+      mapInstance.fitBounds(bounds, {
+        padding: {
+          top: 80,
+          bottom: 60,
+          left: 330,
+          right: 40,
+        },
+        maxZoom: 15,
+        duration: 700,
+      });
     };
 
     if (mapInstance.isStyleLoaded()) {
-      addRoute();
+      addOrUpdateRoute();
     } else {
-      mapInstance.once("load", addRoute);
+      mapInstance.once("load", addOrUpdateRoute);
     }
   }, [route]);
-
-  // Keep the marker synchronized if startLocation is changed
-  // from somewhere other than clicking the map.
-  useEffect(() => {
-    if (!map.current || !startLocation) return;
-
-    const lngLat: [number, number] = [
-      startLocation.longitude,
-      startLocation.latitude,
-    ];
-
-    if (marker.current) {
-      marker.current.setLngLat(lngLat);
-    } else {
-      marker.current = new Marker().setLngLat(lngLat).addTo(map.current);
-    }
-  }, [startLocation]);
 
   return (
     <div
       ref={mapContainer}
       style={{
-        width: "100vw",
-        height: "100vh",
+        position: "absolute",
+        inset: 0,
+        width: "100%",
+        height: "100%",
       }}
     />
   );
